@@ -5,7 +5,7 @@ servers that already follow it:
 
 | Repo | What it does | Runtime | Auth | Writes |
 |---|---|---|---|---|
-| [StocksMCP](https://github.com/ShaneQi/StocksMCP) | Stock/ETF/crypto quotes from Yahoo Finance | Cloudflare Worker (TypeScript, MCP SDK + `agents`) | none (public) | none |
+| [StocksMCP](https://github.com/ShaneQi/StocksMCP) | Stock/ETF/crypto quotes from Yahoo Finance | Cloudflare Worker (TypeScript, MCP SDK + `agents`) | Cloudflare Access | none |
 | [MoinMoinMCP](https://github.com/ShaneQi/MoinMoinMCP) | Read/write a MoinMoin 1.9 wiki over XML-RPC | Cloudflare Worker (JS, no deps) | Cloudflare Access | `ALLOW_WRITES` |
 | [LinkCliMCP](https://github.com/ShaneQi/LinkCliMCP) | Read-only bank/card data via Stripe's link-cli | Container (Node 22) on VPS or Cloud Run | Cloudflare Access | none, by construction |
 | [OFCloudMCP](https://github.com/ShaneQi/OFCloudMCP) | Read/write an OmniFocus database over WebDAV | Container (Node 22) on VPS or Cloud Run | Cloudflare Access | `ALLOW_WRITES` + `dry_run` |
@@ -118,15 +118,18 @@ README.md
 
 ## 5. Authentication: Cloudflare Access
 
-Every server that touches private data MUST sit behind **Cloudflare Access**
-and verify the Access JWT **itself**, on every `/mcp` request. Access decides
+Every server MUST sit behind **Cloudflare Access** and verify the Access JWT
+**itself**, on every `/mcp` request — all four do, including StocksMCP, whose
+data is public. Access decides
 who gets in (identity provider, service token, …); the origin check makes
 sure nobody gets around Access via the `run.app` URL, the VPS IP or a
 `workers.dev` URL.
 
 - **Use the shared `src/access.js` unchanged.** It is byte-identical in
   MoinMoinMCP, LinkCliMCP and OFCloudMCP (check with `md5sum src/access.js`).
-  Fix bugs in all copies in the same change. It:
+  StocksMCP has a line-for-line TypeScript port, `src/access.ts`, with the
+  same behaviour plus `AccessEnv`/`AccessConfig` types. Fix bugs in all
+  copies, the port included, in the same change. It:
   - reads `CF_ACCESS_TEAM_DOMAIN` (`team`, `team.cloudflareaccess.com` or a
     full URL) and `CF_ACCESS_AUD` (comma-separated for several apps);
   - takes the token from `Cf-Access-Jwt-Assertion`, else `Authorization: Bearer`;
@@ -144,9 +147,21 @@ sure nobody gets around Access via the `run.app` URL, the VPS IP or a
   `/health` in probes: some hosts (Cloud Run) reserve paths ending in `z`.
 - **No static bearer tokens.** LinkCliMCP replaced its `ACCESS_TOKEN` with
   Access; don't reintroduce shared secrets in URLs or headers.
-- A **public** server (StocksMCP) is acceptable only for public,
-  non-personal data; say so in the README with the rate limit that bounds
-  abuse.
+- **SDK-based servers check first, then hand off.** StocksMCP runs the
+  Access check in its own `fetch` before calling the SDK's `createMcpHandler`,
+  so the SDK never sees an unauthenticated request.
+- **Client sign-in:** with an Access application on the hostname (StocksMCP
+  uses a "Cloudflare account members" policy), Access answers unauthenticated
+  requests with `401` and points MCP clients at its OAuth sign-in, so
+  claude.ai and Claude Code log in through Access when they connect. Clients
+  that can only send fixed headers use an Access service token
+  (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) with a Service Auth
+  policy.
+- For local `wrangler dev`, put `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` in
+  `.dev.vars` (git-ignored).
+- Even a server with only public data stays behind Access: the URL, the
+  upstream's rate limit and the free-plan request quota are worth protecting.
+  An unauthenticated server needs a reason written in its README.
 
 ## 6. Safety rules for data and secrets
 
@@ -253,6 +268,9 @@ jobs:
 - A deploy replaces only the code: bindings stay (`keep_bindings`), the
   custom domain stays, `workers.dev` and preview URLs stay off so the custom
   domain behind Access is the only way in.
+- Anything not in `wrangler.toml` that the dashboard controls per deploy is
+  reset by it: StocksMCP has no `[observability]` block, so each deploy turns
+  Workers observability off. Put it in `wrangler.toml` if you want it kept.
 - Add a test/typecheck step before deploy once the repo has tests.
 - Manual deploy: `npx wrangler login && npx wrangler deploy`.
 
@@ -383,9 +401,9 @@ agent's) briefing. Sections, in order:
 
 Places where a repo doesn't yet match this guideline:
 
-- **StocksMCP** is public with no Access check (acceptable for public quotes,
-  but it is the only one), has no tests, and its deploy workflow doesn't run
-  `npm run typecheck`.
+- **StocksMCP** has no tests (the Access check in particular), and its
+  deploy workflow doesn't run `npm run typecheck`. Its `access.ts` is a port,
+  so it can drift from the shared `access.js`.
 - **MoinMoinMCP** has no `package.json` or tests (removed in the Python →
   Worker move); its deploy has no test gate.
 - **OFCloudMCP**'s `serverInfo.title` and Dockerfile comment still say
